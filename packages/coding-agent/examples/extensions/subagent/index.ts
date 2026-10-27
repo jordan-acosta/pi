@@ -35,6 +35,7 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const EXIT_STDIO_GRACE_MS = 100;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -347,6 +348,12 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
+			let settled = false;
+			let exited = false;
+			let exitCode: number | null = null;
+			let stdoutEnded = false;
+			let stderrEnded = false;
+			let graceTimer: NodeJS.Timeout | undefined;
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -385,24 +392,65 @@ async function runSingleAgent(
 				}
 			};
 
+			// Descendants that inherit stdout/stderr (e.g. backgrounded shell commands) can keep
+			// the pipes open after the subagent exits, so "close" may never fire. After "exit",
+			// finish once both pipes end or stay idle for EXIT_STDIO_GRACE_MS.
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				if (graceTimer) clearTimeout(graceTimer);
+				if (buffer.trim()) processLine(buffer);
+				buffer = "";
+				proc.stdout.destroy();
+				proc.stderr.destroy();
+				resolve(code);
+			};
+
+			const armGraceTimer = () => {
+				if (graceTimer) clearTimeout(graceTimer);
+				graceTimer = setTimeout(() => finish(exitCode ?? 0), EXIT_STDIO_GRACE_MS);
+			};
+
+			const finishIfDrained = () => {
+				if (exited && stdoutEnded && stderrEnded) finish(exitCode ?? 0);
+			};
+
 			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
+				if (exited && !settled) armGraceTimer();
 			});
 
 			proc.stderr.on("data", (data) => {
 				currentResult.stderr += data.toString();
+				if (exited && !settled) armGraceTimer();
+			});
+
+			proc.stdout.on("end", () => {
+				stdoutEnded = true;
+				finishIfDrained();
+			});
+
+			proc.stderr.on("end", () => {
+				stderrEnded = true;
+				finishIfDrained();
+			});
+
+			proc.on("exit", (code) => {
+				exited = true;
+				exitCode = code;
+				finishIfDrained();
+				if (!settled) armGraceTimer();
 			});
 
 			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				finish(code ?? 0);
 			});
 
 			proc.on("error", () => {
-				resolve(1);
+				finish(1);
 			});
 
 			if (signal) {
